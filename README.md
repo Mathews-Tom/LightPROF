@@ -1,6 +1,6 @@
-# GraphPromptor: A Lightweight Reasoning Framework for LLMs on Knowledge Graphs
+# LightPROF: A Lightweight Reasoning Framework for LLMs on Knowledge Graphs
 
-**GraphPromptor** is a lightweight, efficient reasoning framework based on the "Retrieve → Embed → Reason" methodology described in the paper:
+**LightPROF** is a lightweight, efficient reasoning framework based on the "Retrieve → Embed → Reason" methodology described in the paper:
 
 [LightPROF: A Lightweight Reasoning Framework for Large Language Model on Knowledge Graph](https://arxiv.org/abs/2504.03137)
 
@@ -22,10 +22,10 @@ This section guides you through setting up and running GraphPromptor.
 
 ### Cloning the Repository
 
-Clone the GraphPromptor repository from GitHub:
+Clone the LightPROF repository from GitHub:
 
 ```bash
-git clone https://github.com/AetherForge/GraphPromptor.git
+git clone https://github.com/AetherForge/LightPROF.git
 cd GraphPromptor
 ```
 
@@ -100,7 +100,7 @@ To run the notebook:
 ## Folder Structure
 
 ```bash
-GraphPromptor/
+LightPROF/
 ├── README.md            # Project overview and setup instructions
 ├── requirements.txt     # Python dependencies managed by uv
 ├── data/                # Knowledge Graph triples and data files
