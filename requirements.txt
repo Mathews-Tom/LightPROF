@@ -1,0 +1,7 @@
+networkx
+transformers
+google-generativeai
+torch
+python-dotenv
+jupyter
+pytest
