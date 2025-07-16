@@ -97,7 +97,6 @@ class ReasoningModule:
         print(f"Sending prompt to LLM:\n{full_prompt}")
 
         try:
-            # Perform inference using the frozen LLM
             # The generate_content method sends the prompt to the Gemini model
             response = self.model.generate_content(full_prompt)
 
@@ -109,6 +108,32 @@ class ReasoningModule:
         except Exception as e:
             print(f"Error during LLM inference: {e}")
             return f"Error during inference: {e}"
+
+    def predict_hops(self, question: str) -> int:
+        """
+        Predicts the number of reasoning hops required to answer a given question.
+
+        Args:
+            question (str): The user question for which the number of reasoning hops is to be predicted.
+
+        Returns:
+            int: The predicted number of reasoning hops.
+
+        Raises:
+            NotImplementedError: This method is not yet implemented.
+
+        Notes for Implementation:
+            - "Reasoning hops" typically refers to the number of edges or steps required to connect entities in a knowledge graph to answer the question.
+            - Implementation may require:
+                * Parsing the question to identify entities and relations.
+                * Accessing the underlying knowledge graph to determine possible paths between entities.
+                * Using graph traversal algorithms (e.g., BFS, DFS) to compute shortest or most relevant paths.
+                * Considering question complexity, such as the number of entities or relations involved.
+                * Optionally leveraging machine learning models or LLMs to estimate the required hops based on question features.
+            - The method should be robust to ambiguous or incomplete questions and handle cases where no valid path exists.
+            - Additional data, such as historical question-hop mappings or graph statistics, may improve prediction accuracy.
+        """
+        raise NotImplementedError("predict_hops is not yet implemented.")
 
 
 # Example Usage (for testing the module in isolation)
