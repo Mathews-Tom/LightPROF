@@ -6,7 +6,7 @@
 
 It enables Large Language Models (LLMs), like Gemini 2.5-Flash, to perform complex reasoning over external Knowledge Graphs (KGs) without full model fine-tuning.
 
-By freezing LLM parameters and only training a compact Knowledge Adapter, GraphPromptor delivers high accuracy, efficient memory usage, and faster inference.
+By freezing LLM parameters and only training a compact Knowledge Adapter, LightPROF delivers high accuracy, efficient memory usage, and faster inference.
 
 **Key features:**
 
@@ -18,20 +18,20 @@ By freezing LLM parameters and only training a compact Knowledge Adapter, GraphP
 
 ## Getting Started
 
-This section guides you through setting up and running GraphPromptor.
+This section guides you through setting up and running LightPROF.
 
 ### Cloning the Repository
 
 Clone the LightPROF repository from GitHub:
 
 ```bash
-git clone https://github.com/AetherForge/LightPROF.git
-cd GraphPromptor
+git clone https://github.com/Mathews-Tom/LightPROF.git
+cd LightPROF
 ```
 
 ### Installing Dependencies with UV
 
-GraphPromptor uses `uv` for efficient Python package management.
+LightPROF uses `uv` for efficient Python package management.
 
 1. **Install uv:** If you don't have `uv` installed, follow the instructions on the [uv documentation](https://docs.astral.sh/uv/tutorial/installation/).
 
