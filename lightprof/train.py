@@ -178,6 +178,18 @@ def train_adapter(
 
     # 5. Implement Training Loop
     print("Starting training loop...")
+
+    # --- LLM Setup for Fusion Embedding Training ---
+    # For demonstration, we use a BERT-based masked language model as a stand-in for the LLM.
+    from transformers import AutoModelForMaskedLM
+
+    llm_model = AutoModelForMaskedLM.from_pretrained("bert-base-uncased")
+    llm_model.eval()  # Keep LLM frozen
+    for param in llm_model.parameters():
+        param.requires_grad = False
+
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
     for epoch in range(num_epochs):
         total_loss = 0
         for batch_idx, (subgraphs_batch, target_token_ids_batch) in enumerate(
@@ -196,44 +208,62 @@ def train_adapter(
                 fused_emb = knowledge_adapter(subgraph)
                 batch_fused_embeddings.append(fused_emb)
 
-            # --- Placeholder for LLM Integration and Loss Calculation ---
-            # In a real scenario, the fused_embeddings from the KnowledgeAdapter
-            # for each subgraph in the batch would be processed (e.g., pooled,
-            # projected to a fixed number of soft prompt tokens) and then
-            # injected into the frozen LLM's input sequence along with the
-            # tokenized question and potentially the start of the answer.
-            # The LLM would then perform a forward pass, and logits for the
-            # next tokens in the answer sequence would be obtained.
-            # Cross-entropy loss would be calculated between these logits
-            # and the target_token_ids_batch.
-            # Since we cannot directly interact with the frozen LLM (Gemini)
-            # in this manner with the current setup, we use a placeholder loss.
+            # --- Fusion Embedding LLM Integration and Loss Calculation ---
+            # For each subgraph, we inject the fused embedding as a soft prompt at the start of the LLM's input embeddings.
+            # We use the target_token_ids_batch as the target labels for cross-entropy loss.
 
-            # Placeholder Loss Calculation:
-            # This is NOT the actual cross-entropy next-token prediction loss.
-            # It's a dummy loss to allow the training loop structure to function.
-            # A real implementation requires integrating with the frozen LLM
-            # to get logits after injecting the soft prompt embeddings.
-            # For demonstration, we'll calculate a dummy loss based on the mean
-            # of the concatenated fused embeddings from the batch.
-            # This loss value is meaningless for actual training but allows
-            # backpropagation to occur and demonstrates the training flow.
-            if batch_fused_embeddings:
-                # Concatenate embeddings from all subgraphs in the batch
-                # Note: This concatenation is for the dummy loss only.
-                # Real LLM integration would handle each subgraph's embeddings
-                # in relation to its corresponding target sequence.
-                all_fused = torch.cat(batch_fused_embeddings, dim=0)
+            # Prepare input_ids and attention_mask for each sample in the batch
+            input_ids_list = []
+            attention_mask_list = []
+            max_target_len = 0
+            for target_token_ids in target_token_ids_batch:
+                # For demonstration, prepend a [CLS] token (id=101) to each target sequence
+                input_ids = torch.cat([torch.tensor([101]), target_token_ids])
+                input_ids_list.append(input_ids)
+                attention_mask_list.append(torch.ones_like(input_ids))
+                if input_ids.size(0) > max_target_len:
+                    max_target_len = input_ids.size(0)
 
-                # Dummy loss based on the mean value of the embeddings
-                # Ensure all_fused is not empty before calculating mean
-                if all_fused.numel() > 0:
-                    loss = torch.sum(all_fused) / all_fused.numel()
-                else:
-                    loss = torch.tensor(0.0)  # Handle empty embeddings case
-            else:
-                # Handle case where batch resulted in no fused embeddings
-                loss = torch.tensor(0.0)
+            # Pad input_ids and attention_mask to the same length
+            padded_input_ids = []
+            padded_attention_mask = []
+            for input_ids, attention_mask in zip(input_ids_list, attention_mask_list):
+                pad_len = max_target_len - input_ids.size(0)
+                padded_input_ids.append(
+                    torch.cat([input_ids, torch.zeros(pad_len, dtype=torch.long)])
+                )
+                padded_attention_mask.append(
+                    torch.cat([attention_mask, torch.zeros(pad_len, dtype=torch.long)])
+                )
+            input_ids_batch = torch.stack(padded_input_ids, dim=0)
+            attention_mask_batch = torch.stack(padded_attention_mask, dim=0)
+
+            # Get LLM's input embeddings for the input_ids
+            with torch.no_grad():
+                input_embeds = llm_model.get_input_embeddings()(input_ids_batch)
+
+            # Inject fused embeddings as a soft prompt at the start of each sequence
+            # Assume fused_embeds shape: (batch_size, llm_embedding_dim)
+            # Expand fused_embeds to (batch_size, 1, llm_embedding_dim) and prepend to input_embeds
+            fused_embeds_batch = torch.stack(batch_fused_embeddings, dim=0)
+            fused_embeds_batch = fused_embeds_batch.unsqueeze(1)  # (batch_size, 1, dim)
+            input_embeds_with_fusion = torch.cat([fused_embeds_batch, input_embeds], dim=1)
+
+            # Adjust attention mask to account for the prepended fusion token
+            fusion_attention_mask = torch.ones((attention_mask_batch.size(0), 1), dtype=attention_mask_batch.dtype)
+            attention_mask_with_fusion = torch.cat([fusion_attention_mask, attention_mask_batch], dim=1)
+
+            # Shift labels right to match the LLM's next-token prediction
+            labels = input_ids_batch.clone()
+            labels[labels == 0] = -100  # Ignore padding tokens in loss
+
+            # Forward pass through the LLM using inputs_embeds
+            outputs = llm_model(
+                inputs_embeds=input_embeds_with_fusion,
+                attention_mask=attention_mask_with_fusion,
+                labels=labels,
+            )
+            loss = outputs.loss
 
             # Backpropagation
             loss.backward()
