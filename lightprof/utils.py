@@ -1,81 +1,154 @@
+"""Utility functions for LightPROF.
+
+This module provides utilities for loading knowledge graphs and tokenizers.
+"""
+
+from __future__ import annotations
+
 import csv
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import networkx as nx
 from transformers import AutoTokenizer
 
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
-def load_kg_from_triples(filepath):
-    """
-    Loads a Knowledge Graph from a TSV file containing triples (head, relation, tail).
+
+def load_kg_from_triples(filepath: str | Path) -> nx.DiGraph:
+    """Load a Knowledge Graph from a TSV file containing triples.
+
+    Each line should contain: head<TAB>relation<TAB>tail
 
     Args:
-        filepath (str): The path to the TSV file.
+        filepath: Path to the TSV file containing KG triples.
 
     Returns:
-        nx.DiGraph: A NetworkX directed graph representing the Knowledge Graph.
+        NetworkX directed graph with relation stored as edge attribute.
+
+    Raises:
+        FileNotFoundError: If the filepath does not exist.
+        ValueError: If any row does not contain exactly 3 elements.
     """
+    filepath = Path(filepath)
+    if not filepath.exists():
+        raise FileNotFoundError(f"KG file not found: {filepath}")
+
     kg = nx.DiGraph()
-    with open(filepath, "r", encoding="utf-8") as f:
+
+    with open(filepath, encoding="utf-8") as f:
         reader = csv.reader(f, delimiter="\t")
-        for row in reader:
-            if len(row) == 3:
-                head, relation, tail = row
-                kg.add_edge(head, tail, relation=relation)
+        for line_num, row in enumerate(reader, start=1):
+            if len(row) != 3:
+                raise ValueError(
+                    f"Invalid row at line {line_num}: expected 3 elements, got {len(row)}"
+                )
+            head, relation, tail = row
+            kg.add_edge(head, tail, relation=relation)
+
     return kg
 
 
-def get_gemini_tokenizer():
+def get_llama_tokenizer(
+    model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct",
+) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
+    """Get tokenizer for LLaMA model.
+
+    Args:
+        model_name: HuggingFace model name for LLaMA tokenizer.
+
+    Returns:
+        Tokenizer instance configured for the specified model.
+
+    Raises:
+        OSError: If the tokenizer cannot be loaded.
     """
-    Gets a tokenizer suitable for Gemini models.
-    Using a tokenizer from the transformers library for now.
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # Set pad token if not present (common for LLaMA models)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    return tokenizer
+
+
+def get_bert_tokenizer(
+    model_name: str = "bert-base-uncased",
+) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
+    """Get tokenizer for BERT model (used in Knowledge Adapter).
+
+    Args:
+        model_name: HuggingFace model name for BERT tokenizer.
+
+    Returns:
+        Tokenizer instance configured for the specified model.
+
+    Raises:
+        OSError: If the tokenizer cannot be loaded.
     """
-    # This might need adjustment based on the specific Gemini model and available tokenizers
-    # For now, using a general-purpose tokenizer like 'bert-base-uncased' as a placeholder
-    # or potentially a tokenizer from the google-generativeai library if available and suitable.
-    # The overview mentions 'bert-base-uncased' for the Knowledge Adapter, so let's use a compatible one.
-    try:
-        # Attempt to get a tokenizer from google-generativeai if it exists and is suitable
-        # from google.generativeai.tokenizer import Tokenizer
-        # return Tokenizer.from_model('gemini-pro') # Example, check actual API
-
-        # Fallback to transformers if google-generativeai doesn't provide a suitable one directly
-        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-        return tokenizer
-    except Exception as e:
-        print(
-            f"Could not load Gemini tokenizer directly, falling back or check documentation: {e}"
-        )
-        # Provide a default or raise an error if no tokenizer can be loaded
-        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-        return tokenizer
+    return AutoTokenizer.from_pretrained(model_name)
 
 
-if __name__ == "__main__":
-    # Example usage (for testing)
-    # Create a dummy triples file
-    dummy_triples_content = """entity1\trelationA\tentity2
-entity2\trelationB\tentity3
-entity1\trelationC\tentity3
-"""
-    dummy_filepath = "data/dummy_triples.tsv"
-    # Ensure data directory exists (already done by previous step, but good for standalone test)
-    import os
+# Backward compatibility alias
+def get_gemini_tokenizer() -> PreTrainedTokenizer | PreTrainedTokenizerFast:
+    """Get tokenizer (deprecated, use get_llama_tokenizer instead).
 
-    os.makedirs("data", exist_ok=True)
-    with open(dummy_filepath, "w", encoding="utf-8") as f:
-        f.write(dummy_triples_content)
+    This function is deprecated and will be removed in a future version.
+    Use get_llama_tokenizer() for the LLM or get_bert_tokenizer() for
+    the Knowledge Adapter's text encoder.
 
-    # Load the dummy KG
-    dummy_kg = load_kg_from_triples(dummy_filepath)
-    print(f"Loaded dummy KG with {dummy_kg.number_of_edges()} edges.")
-    print("Edges:")
-    for u, v, data in dummy_kg.edges(data=True):
-        print(f"({u}, {data['relation']}, {v})")
+    Returns:
+        BERT tokenizer as a fallback.
+    """
+    import warnings
 
-    # Get a tokenizer
-    tokenizer = get_gemini_tokenizer()
-    print(f"\nLoaded tokenizer: {type(tokenizer)}")
-    print(f"Tokenizer vocab size: {tokenizer.vocab_size}")
+    warnings.warn(
+        "get_gemini_tokenizer is deprecated. "
+        "Use get_llama_tokenizer() for LLM or get_bert_tokenizer() for adapter.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return get_bert_tokenizer()
 
-    # Clean up dummy file
-    # os.remove(dummy_filepath)
+
+def normalize_entity_name(entity: str) -> str:
+    """Normalize entity name for matching.
+
+    Converts underscores to spaces and applies consistent casing.
+
+    Args:
+        entity: Raw entity name from KG.
+
+    Returns:
+        Normalized entity name.
+    """
+    return entity.replace("_", " ").strip()
+
+
+def normalize_relation_name(relation: str) -> str:
+    """Normalize relation name for display.
+
+    Converts underscores to spaces and removes common prefixes.
+
+    Args:
+        relation: Raw relation name from KG.
+
+    Returns:
+        Normalized relation name.
+    """
+    # Remove common Freebase prefixes
+    prefixes_to_remove = [
+        "base.popstra.",
+        "people.person.",
+        "location.location.",
+        "organization.organization.",
+    ]
+    normalized = relation
+    for prefix in prefixes_to_remove:
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+
+    return normalized.replace("_", " ").strip()

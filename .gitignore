@@ -53,7 +53,6 @@ coverage.xml
 .DS_Store
 
 # Virtual environments
-.env/
 .venv/
 env/
 venv/
@@ -75,5 +74,15 @@ dmypy.json
 # Lock files (uncomment if you want to ignore uv.lock)
 # uv.lock
 
+.env
+
 # Ignore notebook output
 notebooks/.ipynb_checkpoints/
+
+# Agentic Systems
+.claude/
+.opencode/
+
+# Developer workspace (Sage-Dev generated files)
+.docs/
+.sage/

@@ -1,249 +1,390 @@
-from typing import Any, Dict, List, Optional, Tuple
+"""Retrieval Module for LightPROF.
 
-import networkx as nx
+This module implements the reasoning graph retrieval pipeline that extracts
+relevant knowledge paths from the Freebase knowledge graph.
 
-# Assuming load_kg_from_triples and get_gemini_tokenizer might be needed
-# from .utils import load_kg_from_triples, get_gemini_tokenizer
+Reference: LightPROF paper Section 4.1 (Reasoning Graph Retrieval)
 
-# Define a type alias for a Knowledge Graph
-KG = nx.DiGraph
-# Define a type alias for a reasoning path (list of triples)
-ReasoningPath = List[Tuple[str, str, str]]
+Pipeline:
+    1. Semantic Extraction: BERT classifier predicts hop count (1-4)
+    2. Entity Linking: Identify anchor entities in the question
+    3. Relation Retrieval: Constrained BFS from anchor entities
+    4. Path Ranking: Score and select top-k paths
+"""
+
+from __future__ import annotations
+
+import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from lightprof.config import RetrievalConfig
+    from lightprof.data.freebase import FreebaseKG
+    from lightprof.models.hop_predictor import HopPredictor
+
+# Type alias for reasoning paths
+ReasoningPath = list[tuple[str, str, str]]
 
 
 class RetrievalModule:
-    """
-    Retrieval Module responsible for extracting a focused reasoning graph
-    from a Knowledge Graph based on a given question.
+    """Retrieval module for extracting reasoning graphs from KG.
 
-    It performs hop prediction, anchor entity identification, constrained BFS,
-    and path ranking.
+    Per paper Section 4.1: Performs semantic extraction (hop prediction),
+    relation retrieval (constrained BFS), and path ranking.
+
+    Args:
+        kg: Freebase knowledge graph.
+        hop_predictor: BERT-based hop predictor model.
+        config: Retrieval configuration.
+
+    Attributes:
+        kg: Knowledge graph instance.
+        hop_predictor: Hop prediction model.
+        config: Retrieval settings.
     """
 
     def __init__(
         self,
-        kg: KG,
-        hop_predictor: Any = None,
-        entity_linker: Any = None,
-        path_ranker: Any = None,
-    ):
-        """
-        Initializes the RetrievalModule with the Knowledge Graph and optional components.
-
-        Args:
-            kg (KG): The Knowledge Graph (NetworkX DiGraph).
-            hop_predictor (Any, optional): Model/component for predicting hop count. Defaults to None.
-            entity_linker (Any, optional): Model/component for identifying anchor entities. Defaults to None.
-            path_ranker (Any, optional): Model/component for ranking reasoning paths. Defaults to None.
-        """
+        kg: FreebaseKG,
+        hop_predictor: HopPredictor | None = None,
+        config: RetrievalConfig | None = None,
+    ) -> None:
         self.kg = kg
-        # Placeholders for external components
         self.hop_predictor = hop_predictor
-        self.entity_linker = entity_linker
-        self.path_ranker = path_ranker
+
+        # Default config if not provided
+        if config is None:
+            from lightprof.config import RetrievalConfig
+            config = RetrievalConfig()
+        self.config = config
 
     def predict_hops(self, question: str) -> int:
-        """
-        Predicts the number of hops needed for reasoning based on the question.
+        """Predict the number of reasoning hops for a question.
+
+        Per paper Section 4.1: "We initially employ a trained encoder to
+        capture the semantic information of the questions...the encoder
+        classifies questions into different hop categories."
 
         Args:
-            question (str): The input question.
+            question: Natural language question.
 
         Returns:
-            int: The predicted number of hops.
+            Predicted hop count (1 to max_hops).
         """
-        # Placeholder implementation: In a real scenario, this would use self.hop_predictor
-        # For now, return a default or simple heuristic
-        print(f"Predicting hops for question: '{question}'")
-        # Simple heuristic: more words might mean more hops, but this is a naive placeholder
-        # A real implementation would use the BERT-based predictor mentioned in the docs
-        return 2  # Default to 2 hops for demonstration
+        if self.hop_predictor is not None and self.config.use_hop_predictor:
+            predicted = self.hop_predictor.predict(question)
+            return min(predicted, self.config.max_hops)
 
-    def identify_anchor_entities(self, question: str) -> List[str]:
-        """
-        Identifies anchor entities in the question that exist in the KG.
+        # Fallback: heuristic based on question complexity
+        return self._heuristic_hop_prediction(question)
+
+    def _heuristic_hop_prediction(self, question: str) -> int:
+        """Heuristic hop prediction when no trained predictor is available.
+
+        Uses question length and complexity indicators.
 
         Args:
-            question (str): The input question.
+            question: Natural language question.
 
         Returns:
-            List[str]: A list of identified anchor entity IDs from the KG.
+            Estimated hop count (1-4).
         """
-        # Placeholder implementation: In a real scenario, this would use self.entity_linker
-        # or perform NER and then map to KG entities.
-        print(f"Identifying anchor entities for question: '{question}'")
-        # Simple placeholder: Look for exact matches of words/phrases in KG nodes (very basic)
-        # A real implementation would use NER and entity linking techniques.
-        question_words = set(question.lower().replace("?", "").replace(".", "").split())
-        anchor_entities = [
-            node
-            for node in self.kg.nodes()
-            if node.lower() in question_words
-            or any(
-                word in node.lower() for word in question_words
-            )  # Basic substring match
-        ]
-        # Filter to ensure entities actually exist in the KG
-        anchor_entities = [entity for entity in anchor_entities if entity in self.kg]
-        print(f"Identified potential anchor entities: {anchor_entities}")
-        return anchor_entities  # Return all potential matches for now
+        question_lower = question.lower()
 
-    def constrained_bfs(
-        self, start_nodes: List[str], max_hops: int
-    ) -> List[ReasoningPath]:
-        """
-        Performs a constrained Breadth-First Search (BFS) starting from anchor nodes
-        up to a specified maximum number of hops.
-
-        Args:
-            start_nodes (List[str]): The list of starting entity nodes for the BFS.
-            max_hops (int): The maximum depth (number of hops) for the BFS.
-
-        Returns:
-            List[ReasoningPath]: A list of discovered reasoning paths (sequences of triples).
-                                    Each path is a list of (head, relation, tail) tuples.
-        """
-        print(
-            f"Performing constrained BFS from nodes {start_nodes} up to {max_hops} hops."
-        )
-        all_paths: List[ReasoningPath] = []
-        # Use a set to keep track of visited nodes and paths to avoid cycles and redundant exploration
-        visited_paths = set()
-
-        # Initialize the queue for BFS: (current_node, current_path, current_hops)
-        queue: List[Tuple[str, ReasoningPath, int]] = [
-            (node, [], 0) for node in start_nodes if node in self.kg
+        # Multi-hop indicators
+        multi_hop_patterns = [
+            r"who .+ of .+ 's",
+            r"what .+ of .+ 's",
+            r"which .+ that .+",
+            r"where .+ born .+ worked",
+            r"when .+ and .+",
         ]
 
-        while queue:
-            current_node, current_path, current_hops = queue.pop(
-                0
-            )  # Use pop(0) for BFS queue behavior
+        for pattern in multi_hop_patterns:
+            if re.search(pattern, question_lower):
+                return min(3, self.config.max_hops)
 
-            # If we reached the maximum number of hops, add the current path and stop exploring from this node
-            if current_hops >= max_hops:
-                if current_path:  # Only add non-empty paths
-                    path_tuple = tuple(current_path)
-                    if path_tuple not in visited_paths:
-                        all_paths.append(current_path)
-                        visited_paths.add(path_tuple)
-                continue  # Stop exploring further from this path
+        # Check word count
+        word_count = len(question.split())
 
-            # Explore neighbors
-            for neighbor in self.kg.neighbors(current_node):
-                relation = self.kg.get_edge_data(current_node, neighbor)["relation"]
-                new_triple = (current_node, relation, neighbor)
-                new_path = current_path + [new_triple]
+        if word_count > 15:
+            return min(3, self.config.max_hops)
+        if word_count > 10:
+            return min(2, self.config.max_hops)
 
-                # Check for cycles in the new path (simple check: if the neighbor is already in the path as a head or tail)
-                # A more robust cycle detection might be needed for complex graphs
-                is_cycle = False
-                for h, r, t in new_path[
-                    :-1
-                ]:  # Check against triples before the last one
-                    if neighbor == h or neighbor == t:
-                        is_cycle = True
-                        break
+        return 1
 
-                if not is_cycle:
-                    # Add the new path to the queue for further exploration
-                    queue.append((neighbor, new_path, current_hops + 1))
-                    # Also add the path to the results if it's a valid path (e.g., non-empty)
-                    # We add paths at each step to capture paths of different lengths up to max_hops
-                    path_tuple = tuple(new_path)
-                    if path_tuple not in visited_paths:
-                        all_paths.append(new_path)
-                        visited_paths.add(path_tuple)
+    def identify_anchor_entities(
+        self,
+        question: str,
+        provided_entities: list[tuple[str, str]] | None = None,
+    ) -> list[str]:
+        """Identify anchor entities from the question.
 
-        print(f"Found {len(all_paths)} potential paths.")
-        return all_paths
-
-    def rank_paths(
-        self, question: str, paths: List[ReasoningPath]
-    ) -> List[ReasoningPath]:
-        """
-        Ranks the discovered reasoning paths based on their relevance to the question.
+        Per paper: Topic entities are identified from the question for
+        starting the BFS traversal.
 
         Args:
-            question (str): The input question.
-            paths (List[ReasoningPath]): The list of reasoning paths to rank.
+            question: Natural language question.
+            provided_entities: Optional list of (entity_id, entity_name) tuples
+                from dataset annotations.
 
         Returns:
-            List[ReasoningPath]: The list of paths, ranked by relevance.
+            List of entity identifiers found in the KG.
         """
-        # Placeholder implementation: In a real scenario, this would use self.path_ranker
-        # or some other scoring mechanism (e.g., based on semantic similarity, path length, etc.)
-        print(f"Ranking {len(paths)} paths for question: '{question}'")
-        # Simple placeholder: For now, just return the paths as is (no actual ranking)
-        # A real implementation would use the path_ranker component.
-        return paths  # Return unranked paths
+        anchors = []
 
-    def retrieve_paths(self, question: str) -> List[ReasoningPath]:
-        """
-        Main method to retrieve relevant reasoning paths for a given question.
+        # Use provided entities if available (from dataset)
+        if provided_entities:
+            for entity_id, entity_name in provided_entities:
+                # Try entity_id first
+                if self.kg.entity_exists(entity_id):
+                    anchors.append(entity_id)
+                # Then try entity_name
+                elif self.kg.entity_exists(entity_name):
+                    anchors.append(entity_name)
+                # Finally try fuzzy matching
+                else:
+                    matches = self.kg.find_entities_by_name(entity_name, max_results=1)
+                    if matches:
+                        anchors.append(matches[0])
 
-        Orchestrates the steps: hop prediction, entity linking, constrained BFS, and path ranking.
+        # If no provided entities, extract from question text
+        if not anchors:
+            anchors = self._extract_entities_from_text(question)
+
+        return anchors
+
+    def _extract_entities_from_text(self, question: str) -> list[str]:
+        """Extract potential entity mentions from question text.
+
+        Uses simple heuristics for entity extraction when NER is not available.
 
         Args:
-            question (str): The input question.
+            question: Natural language question.
 
         Returns:
-            List[ReasoningPath]: A list of ranked reasoning paths.
+            List of entity identifiers found in KG.
         """
-        # 1. Predict the number of hops
-        predicted_hops = self.predict_hops(question=question)
-        print(f"Predicted hops: {predicted_hops}")
+        # Clean question
+        clean_q = question.replace("?", "").replace(".", "").strip()
 
-        # 2. Identify anchor entities
-        anchor_entities = self.identify_anchor_entities(question=question)
-        print(f"Identified anchor entities: {anchor_entities}")
+        # Extract potential entity mentions (capitalized phrases, quoted strings)
+        potential_entities = []
 
-        # If no anchor entities are found, we cannot perform BFS
-        if not anchor_entities:
-            print("No anchor entities found. Returning empty path list.")
+        # Look for quoted strings
+        quoted = re.findall(r'"([^"]+)"', clean_q)
+        potential_entities.extend(quoted)
+
+        # Look for capitalized words/phrases (proper nouns)
+        words = clean_q.split()
+        i = 0
+        while i < len(words):
+            if words[i][0].isupper() if words[i] else False:
+                # Start of potential entity
+                entity_words = [words[i]]
+                j = i + 1
+                while j < len(words) and (
+                    words[j][0].isupper() if words[j] else False
+                ):
+                    entity_words.append(words[j])
+                    j += 1
+                potential_entities.append(" ".join(entity_words))
+                i = j
+            else:
+                i += 1
+
+        # Find entities in KG
+        found_anchors = []
+        for entity_text in potential_entities:
+            if self.kg.entity_exists(entity_text):
+                found_anchors.append(entity_text)
+            else:
+                matches = self.kg.find_entities_by_name(entity_text, max_results=1)
+                if matches:
+                    found_anchors.append(matches[0])
+
+        return found_anchors
+
+    def retrieve_relation_links(
+        self,
+        anchor_entities: list[str],
+        num_hops: int,
+    ) -> list[list[str]]:
+        """Retrieve relation links via constrained BFS.
+
+        Per paper Section 4.1: "Collect all relation links originating from
+        the anchor entity and extending up to a predetermined length of h_q."
+
+        Args:
+            anchor_entities: Starting entities for BFS.
+            num_hops: Maximum number of hops to explore.
+
+        Returns:
+            List of relation links (sequences of relation names).
+        """
+        all_links: list[list[str]] = []
+
+        for anchor in anchor_entities:
+            links = self.kg.bfs_relation_links(anchor, num_hops)
+            all_links.extend(links)
+
+        return all_links
+
+    def rank_relation_links(
+        self,
+        question: str,
+        relation_links: list[list[str]],
+    ) -> list[list[str]]:
+        """Rank relation links by relevance to the question.
+
+        Per paper Section 4.1: Relation links are ranked by semantic
+        similarity to the question.
+
+        Args:
+            question: Natural language question.
+            relation_links: List of relation link sequences.
+
+        Returns:
+            Sorted list of relation links (most relevant first).
+        """
+        if not relation_links:
             return []
 
-        # 3. Perform constrained BFS
-        discovered_paths = self.constrained_bfs(
-            start_nodes=anchor_entities, max_hops=predicted_hops
+        # Simple ranking: prioritize shorter paths and common relations
+        # A full implementation would use semantic similarity scoring
+
+        # Score based on path length (shorter is often better)
+        scored_links = []
+        for link in relation_links:
+            score = 1.0 / (len(link) + 1)  # Favor shorter paths
+            scored_links.append((score, link))
+
+        # Sort by score (descending)
+        scored_links.sort(key=lambda x: x[0], reverse=True)
+
+        # Return top-k
+        return [link for _, link in scored_links[: self.config.top_k_relations]]
+
+    def sample_reasoning_paths(
+        self,
+        anchor_entities: list[str],
+        relation_links: list[list[str]],
+    ) -> list[ReasoningPath]:
+        """Sample concrete reasoning paths from relation links.
+
+        Args:
+            anchor_entities: Starting entities.
+            relation_links: Ranked relation links.
+
+        Returns:
+            List of reasoning paths (sequences of triples).
+        """
+        all_paths: list[ReasoningPath] = []
+
+        for anchor in anchor_entities:
+            paths = self.kg.sample_reasoning_paths(
+                anchor,
+                relation_links,
+                max_paths_per_link=self.config.max_paths_per_question // max(len(relation_links), 1),
+            )
+            all_paths.extend(paths)
+
+            if len(all_paths) >= self.config.max_paths_per_question:
+                break
+
+        return all_paths[: self.config.max_paths_per_question]
+
+    def retrieve(
+        self,
+        question: str,
+        provided_entities: list[tuple[str, str]] | None = None,
+    ) -> list[ReasoningPath]:
+        """Main retrieval method: extract reasoning paths for a question.
+
+        Orchestrates the full retrieval pipeline:
+        1. Predict hops
+        2. Identify anchor entities
+        3. Retrieve relation links via BFS
+        4. Rank relation links
+        5. Sample concrete paths
+
+        Args:
+            question: Natural language question.
+            provided_entities: Optional annotated entities from dataset.
+
+        Returns:
+            List of reasoning paths for the Knowledge Adapter.
+        """
+        # Step 1: Predict hop count
+        num_hops = self.predict_hops(question)
+
+        # Step 2: Identify anchor entities
+        anchor_entities = self.identify_anchor_entities(question, provided_entities)
+
+        if not anchor_entities:
+            return []
+
+        # Step 3: Retrieve relation links via BFS
+        relation_links = self.retrieve_relation_links(anchor_entities, num_hops)
+
+        if not relation_links:
+            return []
+
+        # Step 4: Rank relation links
+        ranked_links = self.rank_relation_links(question, relation_links)
+
+        # Step 5: Sample concrete paths
+        reasoning_paths = self.sample_reasoning_paths(anchor_entities, ranked_links)
+
+        return reasoning_paths
+
+    def retrieve_with_metadata(
+        self,
+        question: str,
+        provided_entities: list[tuple[str, str]] | None = None,
+    ) -> dict:
+        """Retrieve reasoning paths with additional metadata.
+
+        Useful for debugging and analysis.
+
+        Args:
+            question: Natural language question.
+            provided_entities: Optional annotated entities.
+
+        Returns:
+            Dictionary with paths and retrieval metadata.
+        """
+        num_hops = self.predict_hops(question)
+        anchor_entities = self.identify_anchor_entities(question, provided_entities)
+
+        if not anchor_entities:
+            return {
+                "paths": [],
+                "num_hops": num_hops,
+                "anchor_entities": [],
+                "num_relation_links": 0,
+            }
+
+        relation_links = self.retrieve_relation_links(anchor_entities, num_hops)
+        ranked_links = self.rank_relation_links(question, relation_links)
+        reasoning_paths = self.sample_reasoning_paths(anchor_entities, ranked_links)
+
+        return {
+            "paths": reasoning_paths,
+            "num_hops": num_hops,
+            "anchor_entities": anchor_entities,
+            "num_relation_links": len(relation_links),
+            "num_paths": len(reasoning_paths),
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"RetrievalModule(\n"
+            f"  kg_entities={self.kg.num_entities},\n"
+            f"  kg_relations={self.kg.num_relations},\n"
+            f"  max_hops={self.config.max_hops},\n"
+            f"  top_k_relations={self.config.top_k_relations},\n"
+            f"  max_paths={self.config.max_paths_per_question}\n"
+            f")"
         )
-        print(f"Discovered {len(discovered_paths)} paths via BFS.")
-
-        # 4. Rank the discovered paths
-        ranked_paths = self.rank_paths(question=question, paths=discovered_paths)
-        print(f"Ranked {len(ranked_paths)} paths.")
-
-        return ranked_paths
-
-
-# Example Usage (Optional - can be added for testing the module)
-# if __name__ == '__main__':
-#     # Create a dummy KG for demonstration
-#     dummy_kg = nx.DiGraph()
-#     dummy_kg.add_edge("entity1", "entity2", relation="relationA")
-#     dummy_kg.add_edge("entity2", "entity3", relation="relationB")
-#     dummy_kg.add_edge("entity1", "entity3", relation="relationC")
-#     dummy_kg.add_edge("entity3", "entity4", relation="relationD")
-#     dummy_kg.add_edge("entity4", "entity5", relation="relationE")
-#     dummy_kg.add_edge("entity1", "entity4", relation="relationF") # Longer path
-
-#     # Initialize the RetrievalModule with the dummy KG
-#     retrieval_module = RetrievalModule(kg=dummy_kg)
-
-#     # Example question
-#     question = "What is the relation between entity1 and entity3?"
-
-#     # Retrieve paths
-#     retrieved_paths = retrieval_module.retrieve_paths(question=question)
-
-#     print("\nRetrieved Paths:")
-#     for path in retrieved_paths:
-#         print(path)
-
-#     # Example with more hops
-#     question_long = "Tell me about entity5 starting from entity1"
-#     retrieved_paths_long = retrieval_module.retrieve_paths(question=question_long)
-
-#     print("\nRetrieved Paths (longer query):")
-#     for path in retrieved_paths_long:
-#         print(path)
