@@ -1,322 +1,484 @@
-from typing import Any, Dict, List, Tuple
+"""Training pipeline for LightPROF.
 
-import networkx as nx
+This module implements the training loop for the Knowledge Adapter
+with a frozen LLM (LLaMA-3-8B-Instruct).
+
+Reference: LightPROF paper Section 5 (Experiments)
+
+Training:
+    - Only Knowledge Adapter parameters are trained
+    - LLM and BERT are frozen
+    - Loss is computed on answer tokens only (causal LM loss)
+    - Optimizer: AdamW with weight decay
+    - Scheduler: Cosine annealing with warmup
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from transformers import get_cosine_schedule_with_warmup
 
 from lightprof.adapter import KnowledgeAdapter
-from lightprof.reasoning import (
-    ReasoningModule,  # Initialize but not used in core training loop
-)
+from lightprof.config import LightPROFConfig
+from lightprof.data.freebase import FreebaseKG
+from lightprof.reasoning import ReasoningModule
 from lightprof.retrieval import RetrievalModule
 
-# Import modules from the lightprof project
-from lightprof.utils import get_gemini_tokenizer, load_kg_from_triples
+if TYPE_CHECKING:
+    from lightprof.data.cwq import CWQDataset
+    from lightprof.data.webqsp import WebQSPDataset
 
-# Define type aliases for clarity
-Triple = Tuple[str, str, str]
-Path = List[Triple]
-Subgraph = List[Path]
+logger = logging.getLogger(__name__)
 
 
-class DummyKGDataset(Dataset):
-    """
-    A dummy dataset for training the KnowledgeAdapter.
-    Provides dummy subgraphs and corresponding dummy target token IDs.
-    In a real scenario, subgraphs would be retrieved based on questions,
-    and target token IDs would come from the correct answers tokenized by the LLM's tokenizer.
+class Trainer:
+    """Trainer for LightPROF Knowledge Adapter.
+
+    Handles the training loop, optimizer setup, and logging.
+
+    Args:
+        config: LightPROF configuration.
+        adapter: Knowledge Adapter model.
+        reasoning: Reasoning module with frozen LLM.
+        train_dataset: Training dataset.
+        val_dataset: Validation dataset (optional).
+
+    Attributes:
+        config: Configuration settings.
+        adapter: Knowledge Adapter being trained.
+        reasoning: Reasoning module for loss computation.
+        train_loader: Training data loader.
+        val_loader: Validation data loader.
+        optimizer: AdamW optimizer.
+        scheduler: Learning rate scheduler.
     """
 
     def __init__(
         self,
-        num_samples: int = 100,
-        max_paths_per_subgraph: int = 3,
-        max_triples_per_path: int = 2,
-        max_target_len: int = 10,
-    ):
-        """
-        Initializes the dummy dataset.
+        config: LightPROFConfig,
+        adapter: KnowledgeAdapter,
+        reasoning: ReasoningModule,
+        train_dataset: WebQSPDataset | CWQDataset,
+        val_dataset: WebQSPDataset | CWQDataset | None = None,
+    ) -> None:
+        self.config = config
+        self.adapter = adapter
+        self.reasoning = reasoning
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
 
-        Args:
-            num_samples (int): Number of dummy samples to generate.
-            max_paths_per_subgraph (int): Maximum number of paths in a dummy subgraph.
-            max_triples_per_path (int): Maximum number of triples in a dummy path.
-            max_target_len (int): Maximum length of dummy target token sequences.
-        """
-        super().__init__()
-        self.num_samples = num_samples
-        self.max_paths_per_subgraph = max_paths_per_subgraph
-        self.max_triples_per_path = max_triples_per_path
-        self.max_target_len = max_target_len
-        self.data = self._generate_dummy_data()
-
-        # Get a tokenizer to generate dummy target token IDs
-        # In a real scenario, this would be the LLM's tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "bert-base-uncased"
-        )  # Using BERT tokenizer as placeholder
-
-    def _generate_dummy_data(self) -> List[Tuple[Subgraph, torch.Tensor]]:
-        """
-        Generates dummy subgraphs and target token IDs.
-        """
-        dummy_data = []
-        for _ in range(self.num_samples):
-            # Generate a dummy subgraph
-            subgraph: Subgraph = []
-            num_paths = torch.randint(1, self.max_paths_per_subgraph + 1, (1,)).item()
-            for _ in range(num_paths):
-                path: Path = []
-                num_triples = torch.randint(
-                    1, self.max_triples_per_path + 1, (1,)
-                ).item()
-                for i in range(num_triples):
-                    head = f"entity_{torch.randint(0, 20, (1,)).item()}"
-                    relation = f"relation_{torch.randint(0, 5, (1,)).item()}"
-                    tail = f"entity_{torch.randint(0, 20, (1,)).item()}"
-                    path.append((head, relation, tail))
-                if path:
-                    subgraph.append(path)
-
-            # Generate dummy target token IDs
-            # In a real scenario, this would be the tokenized correct answer
-            target_len = torch.randint(1, self.max_target_len + 1, (1,)).item()
-            # Generate random token IDs within a plausible range (e.g., first 1000 tokens)
-            target_token_ids = torch.randint(0, 1000, (target_len,), dtype=torch.long)
-
-            dummy_data.append((subgraph, target_token_ids))
-        return dummy_data
-
-    def __len__(self) -> int:
-        """
-        Returns the number of samples in the dataset.
-        """
-        return self.num_samples
-
-    def __getitem__(self, idx: int) -> Tuple[Subgraph, torch.Tensor]:
-        """
-        Retrieves a sample from the dataset.
-        """
-        return self.data[idx]
-
-
-def train_adapter(
-    kg_filepath: str,
-    num_epochs: int = 10,
-    batch_size: int = 32,
-    learning_rate: float = 2e-3,
-    warmup_steps: int = 100,
-    weight_decay: float = 0.01,
-    dummy_dataset_size: int = 1000,  # Size for the dummy dataset
-):
-    """
-    Implements the training loop for the KnowledgeAdapter.
-
-    Args:
-        kg_filepath (str): Path to the Knowledge Graph triples file.
-        num_epochs (int): Number of training epochs.
-        batch_size (int): Batch size for training.
-        learning_rate (float): Learning rate for the optimizer.
-        warmup_steps (int): Number of warmup steps for the learning rate scheduler.
-        weight_decay (float): Weight decay for the optimizer.
-        dummy_dataset_size (int): Number of samples in the dummy dataset.
-    """
-    print("Starting KnowledgeAdapter training...")
-
-    # 1. Load the Knowledge Graph
-    print(f"Loading Knowledge Graph from {kg_filepath}...")
-    try:
-        kg = load_kg_from_triples(filepath=kg_filepath)
-        print(f"Loaded KG with {kg.number_of_edges()} edges.")
-    except FileNotFoundError:
-        print(f"Error: KG file not found at {kg_filepath}")
-        return
-    except Exception as e:
-        print(f"Error loading KG: {e}")
-        return
-
-    # 2. Initialize Modules
-    # RetrievalModule and ReasoningModule are initialized as per instructions,
-    # but are not directly involved in the KnowledgeAdapter training loop itself
-    # as the LLM is frozen and retrieval is assumed to provide the subgraph input.
-    print("Initializing RetrievalModule, KnowledgeAdapter, and ReasoningModule...")
-    retrieval_module = RetrievalModule(kg=kg)
-    knowledge_adapter = KnowledgeAdapter()
-    reasoning_module = ReasoningModule()  # Requires GOOGLE_API_KEY env var
-
-    # Ensure KnowledgeAdapter is in training mode
-    knowledge_adapter.train()
-
-    # 3. Set up Data Loading
-    print(f"Setting up dummy dataset with {dummy_dataset_size} samples...")
-    dummy_dataset = DummyKGDataset(num_samples=dummy_dataset_size)
-    # Need a custom collate_fn if we want to batch subgraphs properly.
-    # For this placeholder, we'll process subgraphs one by one in the loop,
-    # so the default collate_fn is fine, but batch_size > 1 will result in
-    # a batch of lists of lists of tuples.
-    # Let's modify the loop to handle batch_size > 1, processing each subgraph.
-    dummy_dataloader = DataLoader(dummy_dataset, batch_size=batch_size, shuffle=True)
-    print(f"DataLoader created with batch size {batch_size}.")
-
-    # 4. Configure Optimizer and Scheduler
-    print("Configuring optimizer (AdamW) and scheduler (Cosine with Warmup)...")
-    # Only train parameters of the KnowledgeAdapter (and its projector layers)
-    optimizer = optim.AdamW(
-        knowledge_adapter.parameters(), lr=learning_rate, weight_decay=weight_decay
-    )
-
-    # Calculate total training steps for the scheduler
-    total_steps = len(dummy_dataloader) * num_epochs
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
-    )
-    print(f"Total training steps: {total_steps}")
-    print(f"Warmup steps: {warmup_steps}")
-
-    # 5. Implement Training Loop
-    print("Starting training loop...")
-
-    # --- LLM Setup for Fusion Embedding Training ---
-    # For demonstration, we use a BERT-based masked language model as a stand-in for the LLM.
-    from transformers import AutoModelForMaskedLM
-
-    llm_model = AutoModelForMaskedLM.from_pretrained("bert-base-uncased")
-    llm_model.eval()  # Keep LLM frozen
-    for param in llm_model.parameters():
-        param.requires_grad = False
-
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-
-    for epoch in range(num_epochs):
-        total_loss = 0
-        for batch_idx, (subgraphs_batch, target_token_ids_batch) in enumerate(
-            dummy_dataloader
-        ):
-            # subgraphs_batch is a list of Subgraph (List[Path])
-            # target_token_ids_batch is a list of target_token_ids (torch.Tensor)
-
-            # Zero gradients
-            optimizer.zero_grad()
-
-            # Process each subgraph in the batch
-            batch_fused_embeddings: List[torch.Tensor] = []
-            for subgraph in subgraphs_batch:
-                # KnowledgeAdapter expects a single Subgraph (List[Path])
-                fused_emb = knowledge_adapter(subgraph)
-                batch_fused_embeddings.append(fused_emb)
-
-            # --- Fusion Embedding LLM Integration and Loss Calculation ---
-            # For each subgraph, we inject the fused embedding as a soft prompt at the start of the LLM's input embeddings.
-            # We use the target_token_ids_batch as the target labels for cross-entropy loss.
-
-            # Prepare input_ids and attention_mask for each sample in the batch
-            input_ids_list = []
-            attention_mask_list = []
-            max_target_len = 0
-            for target_token_ids in target_token_ids_batch:
-                # For demonstration, prepend a [CLS] token (id=101) to each target sequence
-                input_ids = torch.cat([torch.tensor([101]), target_token_ids])
-                input_ids_list.append(input_ids)
-                attention_mask_list.append(torch.ones_like(input_ids))
-                if input_ids.size(0) > max_target_len:
-                    max_target_len = input_ids.size(0)
-
-            # Pad input_ids and attention_mask to the same length
-            padded_input_ids = []
-            padded_attention_mask = []
-            for input_ids, attention_mask in zip(input_ids_list, attention_mask_list):
-                pad_len = max_target_len - input_ids.size(0)
-                padded_input_ids.append(
-                    torch.cat([input_ids, torch.zeros(pad_len, dtype=torch.long)])
-                )
-                padded_attention_mask.append(
-                    torch.cat([attention_mask, torch.zeros(pad_len, dtype=torch.long)])
-                )
-            input_ids_batch = torch.stack(padded_input_ids, dim=0)
-            attention_mask_batch = torch.stack(padded_attention_mask, dim=0)
-
-            # Get LLM's input embeddings for the input_ids
-            with torch.no_grad():
-                input_embeds = llm_model.get_input_embeddings()(input_ids_batch)
-
-            # Inject fused embeddings as a soft prompt at the start of each sequence
-            # Assume fused_embeds shape: (batch_size, llm_embedding_dim)
-            # Expand fused_embeds to (batch_size, 1, llm_embedding_dim) and prepend to input_embeds
-            fused_embeds_batch = torch.stack(batch_fused_embeddings, dim=0)
-            fused_embeds_batch = fused_embeds_batch.unsqueeze(1)  # (batch_size, 1, dim)
-            input_embeds_with_fusion = torch.cat([fused_embeds_batch, input_embeds], dim=1)
-
-            # Adjust attention mask to account for the prepended fusion token
-            fusion_attention_mask = torch.ones((attention_mask_batch.size(0), 1), dtype=attention_mask_batch.dtype)
-            attention_mask_with_fusion = torch.cat([fusion_attention_mask, attention_mask_batch], dim=1)
-
-            # Shift labels right to match the LLM's next-token prediction
-            labels = input_ids_batch.clone()
-            labels[labels == 0] = -100  # Ignore padding tokens in loss
-
-            # Forward pass through the LLM using inputs_embeds
-            outputs = llm_model(
-                inputs_embeds=input_embeds_with_fusion,
-                attention_mask=attention_mask_with_fusion,
-                labels=labels,
-            )
-            loss = outputs.loss
-
-            # Backpropagation
-            loss.backward()
-
-            # Optimizer step
-            optimizer.step()
-
-            # Scheduler step
-            scheduler.step()
-
-            total_loss += loss.item()
-
-            if (batch_idx + 1) % 10 == 0:
-                print(
-                    f"Epoch [{epoch + 1}/{num_epochs}], Step [{batch_idx + 1}/{len(dummy_dataloader)}], Dummy Loss: {loss.item():.4f}"
-                )
-
-        avg_loss = total_loss / len(dummy_dataloader)
-        print(
-            f"Epoch [{epoch + 1}/{num_epochs}] finished, Average Dummy Loss: {avg_loss:.4f}"
+        # Data loaders
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=1,  # Process one sample at a time due to variable paths
+            shuffle=True,
+            num_workers=0,  # Avoid pickling issues with complex objects
         )
 
-    print("Training finished.")
-    # TODO: Add evaluation logic (requires a separate evaluation dataset and metric)
-    # TODO: Add model saving logic
+        self.val_loader = None
+        if val_dataset is not None:
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=0,
+            )
+
+        # Optimizer (only train adapter parameters)
+        self.optimizer = AdamW(
+            self.adapter.trainable_parameters,
+            lr=config.training.learning_rate,
+            weight_decay=config.training.weight_decay,
+        )
+
+        # Scheduler
+        num_training_steps = (
+            len(self.train_loader)
+            * config.training.num_epochs
+            // config.training.gradient_accumulation_steps
+        )
+        num_warmup_steps = int(num_training_steps * config.training.warmup_ratio)
+
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+
+        # Training state
+        self.global_step = 0
+        self.epoch = 0
+
+    @property
+    def device(self) -> torch.device:
+        """Get the training device."""
+        return self.reasoning.device
+
+    def train_epoch(self) -> float:
+        """Train for one epoch.
+
+        Returns:
+            Average training loss for the epoch.
+        """
+        self.adapter.train()
+        total_loss = 0.0
+        num_samples = 0
+
+        accumulation_steps = self.config.training.gradient_accumulation_steps
+        self.optimizer.zero_grad()
+
+        for batch_idx, batch in enumerate(self.train_loader):
+            # Extract batch data
+            question = batch["question"]
+            if isinstance(question, list):
+                question = question[0]
+
+            reasoning_paths = batch["reasoning_paths"]
+            if isinstance(reasoning_paths, list) and len(reasoning_paths) == 1:
+                reasoning_paths = reasoning_paths[0]
+
+            answers = batch["answers"]
+            if isinstance(answers, list) and len(answers) > 0:
+                if isinstance(answers[0], list):
+                    answers = answers[0]
+                answer_text = ", ".join(answers) if answers else ""
+            else:
+                answer_text = ""
+
+            if not answer_text:
+                continue
+
+            # Forward pass
+            loss = self.reasoning.forward_for_training(
+                question=question,
+                reasoning_paths=reasoning_paths,
+                answer=answer_text,
+            )
+
+            # Scale loss for gradient accumulation
+            loss = loss / accumulation_steps
+            loss.backward()
+
+            total_loss += loss.item() * accumulation_steps
+            num_samples += 1
+
+            # Optimizer step
+            if (batch_idx + 1) % accumulation_steps == 0:
+                # Gradient clipping
+                nn.utils.clip_grad_norm_(
+                    self.adapter.trainable_parameters,
+                    self.config.training.max_grad_norm,
+                )
+
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+                self.global_step += 1
+
+                # Logging
+                if self.global_step % 10 == 0:
+                    lr = self.scheduler.get_last_lr()[0]
+                    logger.info(
+                        f"Step {self.global_step}, Loss: {loss.item() * accumulation_steps:.4f}, LR: {lr:.2e}"
+                    )
+
+        # Handle remaining gradients
+        if (batch_idx + 1) % accumulation_steps != 0:
+            nn.utils.clip_grad_norm_(
+                self.adapter.trainable_parameters,
+                self.config.training.max_grad_norm,
+            )
+            self.optimizer.step()
+            self.scheduler.step()
+            self.optimizer.zero_grad()
+            self.global_step += 1
+
+        return total_loss / max(num_samples, 1)
+
+    @torch.no_grad()
+    def evaluate(self) -> dict[str, float]:
+        """Evaluate on validation set.
+
+        Returns:
+            Dictionary with evaluation metrics.
+        """
+        if self.val_loader is None:
+            return {}
+
+        self.adapter.eval()
+        total_loss = 0.0
+        num_samples = 0
+
+        for batch in self.val_loader:
+            question = batch["question"]
+            if isinstance(question, list):
+                question = question[0]
+
+            reasoning_paths = batch["reasoning_paths"]
+            if isinstance(reasoning_paths, list) and len(reasoning_paths) == 1:
+                reasoning_paths = reasoning_paths[0]
+
+            answers = batch["answers"]
+            if isinstance(answers, list) and len(answers) > 0:
+                if isinstance(answers[0], list):
+                    answers = answers[0]
+                answer_text = ", ".join(answers) if answers else ""
+            else:
+                answer_text = ""
+
+            if not answer_text:
+                continue
+
+            loss = self.reasoning.forward_for_training(
+                question=question,
+                reasoning_paths=reasoning_paths,
+                answer=answer_text,
+            )
+
+            total_loss += loss.item()
+            num_samples += 1
+
+        return {
+            "val_loss": total_loss / max(num_samples, 1),
+        }
+
+    def train(self) -> KnowledgeAdapter:
+        """Run full training loop.
+
+        Returns:
+            Trained Knowledge Adapter.
+        """
+        logger.info("Starting training...")
+        logger.info(f"  Epochs: {self.config.training.num_epochs}")
+        logger.info(f"  Train samples: {len(self.train_dataset)}")
+        logger.info(f"  Trainable params: {self.adapter.num_trainable_parameters:,}")
+
+        best_val_loss = float("inf")
+
+        for epoch in range(self.config.training.num_epochs):
+            self.epoch = epoch
+            logger.info(f"\nEpoch {epoch + 1}/{self.config.training.num_epochs}")
+
+            # Training
+            train_loss = self.train_epoch()
+            logger.info(f"  Train Loss: {train_loss:.4f}")
+
+            # Validation
+            if self.val_loader is not None:
+                metrics = self.evaluate()
+                val_loss = metrics.get("val_loss", float("inf"))
+                logger.info(f"  Val Loss: {val_loss:.4f}")
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    logger.info("  New best validation loss!")
+
+        logger.info("\nTraining complete!")
+        return self.adapter
+
+    def save_checkpoint(self, path: str | Path) -> None:
+        """Save training checkpoint.
+
+        Args:
+            path: Path to save checkpoint.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        checkpoint = {
+            "epoch": self.epoch,
+            "global_step": self.global_step,
+            "adapter_state_dict": self.adapter.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "config": self.config,
+        }
+
+        torch.save(checkpoint, path)
+        logger.info(f"Saved checkpoint to {path}")
+
+    def load_checkpoint(self, path: str | Path) -> None:
+        """Load training checkpoint.
+
+        Args:
+            path: Path to checkpoint file.
+        """
+        path = Path(path)
+        checkpoint = torch.load(path, map_location=self.device)
+
+        self.epoch = checkpoint["epoch"]
+        self.global_step = checkpoint["global_step"]
+        self.adapter.load_state_dict(checkpoint["adapter_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+        logger.info(f"Loaded checkpoint from {path} (epoch {self.epoch})")
 
 
-if __name__ == "__main__":
-    # Example usage:
-    # Ensure a dummy KG file exists for loading
-    dummy_kg_filepath = "data/dummy_triples.tsv"
-    import os
+def train(
+    config: LightPROFConfig,
+    train_dataset: WebQSPDataset | CWQDataset,
+    val_dataset: WebQSPDataset | CWQDataset | None = None,
+    checkpoint_dir: str | Path | None = None,
+) -> KnowledgeAdapter:
+    """Train Knowledge Adapter with frozen LLM.
 
-    if not os.path.exists("data"):
-        os.makedirs("data")
-    if not os.path.exists(dummy_kg_filepath):
-        dummy_triples_content = """entity1\trelationA\tentity2
-entity2\trelationB\tentity3
-entity1\trelationC\tentity3
-"""
-        with open(dummy_kg_filepath, "w", encoding="utf-8") as f:
-            f.write(dummy_triples_content)
-        print(f"Created dummy KG file at {dummy_kg_filepath}")
-    else:
-        print(f"Using existing dummy KG file at {dummy_kg_filepath}")
+    Convenience function for training.
 
-    # Run the training function
-    train_adapter(
-        kg_filepath=dummy_kg_filepath,
-        num_epochs=5,
-        batch_size=16,
-        learning_rate=2e-3,
-        warmup_steps=50,
-        weight_decay=0.01,
-        dummy_dataset_size=200,  # Smaller dataset for quick test
+    Args:
+        config: LightPROF configuration.
+        train_dataset: Training dataset.
+        val_dataset: Validation dataset (optional).
+        checkpoint_dir: Directory to save checkpoints.
+
+    Returns:
+        Trained Knowledge Adapter.
+    """
+    # Set random seed
+    torch.manual_seed(config.training.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.training.seed)
+
+    # Initialize adapter
+    adapter = KnowledgeAdapter(config.model, config.adapter)
+
+    # Initialize reasoning module (includes frozen LLM)
+    reasoning = ReasoningModule(
+        model_config=config.model,
+        knowledge_adapter=adapter,
+        device="auto",
     )
+
+    # Create trainer
+    trainer = Trainer(
+        config=config,
+        adapter=adapter,
+        reasoning=reasoning,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+    )
+
+    # Train
+    trained_adapter = trainer.train()
+
+    # Save final checkpoint
+    if checkpoint_dir is not None:
+        checkpoint_path = Path(checkpoint_dir) / "final_adapter.pt"
+        trainer.save_checkpoint(checkpoint_path)
+
+    return trained_adapter
+
+
+def train_from_config(
+    config_path: str | Path,
+    checkpoint_dir: str | Path | None = None,
+) -> KnowledgeAdapter:
+    """Train from configuration file.
+
+    Args:
+        config_path: Path to TOML configuration file.
+        checkpoint_dir: Directory to save checkpoints.
+
+    Returns:
+        Trained Knowledge Adapter.
+    """
+    # Load configuration
+    config = LightPROFConfig.from_toml(config_path)
+
+    # Load knowledge graph
+    kg = FreebaseKG(config.data.kg_path)
+
+    # Create retrieval module for datasets
+    retrieval = RetrievalModule(kg=kg, config=config.retrieval)
+
+    # Import dataset classes
+    from lightprof.data.webqsp import WebQSPDataset
+    from lightprof.data.cwq import CWQDataset
+
+    # Load tokenizer
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(config.model.llm_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Load datasets based on config
+    if config.data.dataset_name == "webqsp":
+        train_dataset = WebQSPDataset(
+            config.data.train_path,
+            kg=kg,
+            tokenizer=tokenizer,
+            max_hops=config.retrieval.max_hops,
+        )
+        val_dataset = None
+        if Path(config.data.val_path).exists():
+            val_dataset = WebQSPDataset(
+                config.data.val_path,
+                kg=kg,
+                tokenizer=tokenizer,
+                max_hops=config.retrieval.max_hops,
+            )
+    elif config.data.dataset_name == "cwq":
+        train_dataset = CWQDataset(
+            config.data.train_path,
+            kg=kg,
+            tokenizer=tokenizer,
+            max_hops=config.retrieval.max_hops,
+        )
+        val_dataset = None
+        if Path(config.data.val_path).exists():
+            val_dataset = CWQDataset(
+                config.data.val_path,
+                kg=kg,
+                tokenizer=tokenizer,
+                max_hops=config.retrieval.max_hops,
+            )
+    else:
+        raise ValueError(f"Unknown dataset: {config.data.dataset_name}")
+
+    return train(
+        config=config,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        checkpoint_dir=checkpoint_dir,
+    )
+
+
+# CLI entry point
+if __name__ == "__main__":
+    import argparse
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    parser = argparse.ArgumentParser(description="Train LightPROF Knowledge Adapter")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/default.toml",
+        help="Path to configuration file",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="checkpoints",
+        help="Directory to save checkpoints",
+    )
+
+    args = parser.parse_args()
+
+    trained_adapter = train_from_config(
+        config_path=args.config,
+        checkpoint_dir=args.checkpoint_dir,
+    )
+
+    print(f"\nTraining complete!")
+    print(f"Adapter: {trained_adapter}")
