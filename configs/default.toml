@@ -1,0 +1,41 @@
+# LightPROF Default Configuration
+# Based on paper arXiv:2504.03137
+
+[model]
+llm_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+llm_embedding_dim = 4096
+bert_model_name = "bert-base-uncased"
+bert_embedding_dim = 768
+freeze_llm = true
+freeze_bert = true
+
+[adapter]
+structural_mlp_hidden_dim = 64
+knowledge_encoder_layers = 2
+knowledge_encoder_heads = 8
+projector_hidden_dim = 2048
+dropout = 0.1
+
+[retrieval]
+max_hops = 4
+top_k_relations = 10
+max_paths_per_question = 20
+use_hop_predictor = true
+
+[training]
+batch_size = 4
+learning_rate = 2e-3
+num_epochs = 1
+warmup_ratio = 0.1
+weight_decay = 0.01
+gradient_accumulation_steps = 1
+max_grad_norm = 1.0
+fp16 = true
+seed = 42
+
+[data]
+kg_path = "data/freebase_triples.tsv"
+train_path = "data/train.json"
+val_path = "data/val.json"
+test_path = "data/test.json"
+dataset_name = "webqsp"
