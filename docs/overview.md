@@ -1,241 +1,483 @@
-# GraphPromptor: A Lightweight Reasoning Framework for LLMs on Knowledge Graphs
+# LightPROF: Technical Overview
 
 ## 1. Overview
 
-**GraphPromptor** is a lightweight, efficient reasoning framework based on the "Retrieve → Embed → Reason" methodology described in the paper:
+**LightPROF** is a lightweight reasoning framework implementing the methodology from:
 
-[LightPROF: A Lightweight Reasoning Framework for Large Language Model on Knowledge Graph](https://arxiv.org/abs/2504.03137)
+> [LightPROF: A Lightweight Reasoning Framework for Large Language Model on Knowledge Graph](https://arxiv.org/abs/2504.03137)
 
-It enables Large Language Models (LLMs), like Gemini 2.5-Flash, to perform complex reasoning over external Knowledge Graphs (KGs) without full model fine-tuning.
+The framework enables LLaMA-3-8B-Instruct to perform multi-hop reasoning over Knowledge Graphs by training only a compact Knowledge Adapter (~1M parameters) while keeping the LLM frozen.
 
-### Target Audience
+### Design Principles
 
-This document is intended for technical users interested in understanding and using the GraphPromptor project.
+- **Efficiency**: Only train the Knowledge Adapter, freeze all other components
+- **Paper Alignment**: Implements exact architecture from arXiv:2504.03137
+- **Modularity**: Separate components for retrieval, embedding, and reasoning
+- **Reproducibility**: Configuration-driven with TOML support
 
-By freezing LLM parameters and only training a compact Knowledge Adapter, GraphPromptor delivers high accuracy, efficient memory usage, and faster inference.
+## 2. Architecture
 
-**Key features:**
+### Three-Stage Pipeline
 
-- Multi-hop reasoning with minimal token overhead
-- Soft prompt generation by combining graph structure and textual information
-- Compatibility with open-source and commercial LLMs
-- Flexible knowledge graph backends (NetworkX first, scalable to DGL-KE/PyG)
-- Modular design for easy extensions
+```
+Stage 1: Reasoning Graph Retrieval
+  ├── Hop Prediction: BERT classifier predicts hop count (1-4)
+  ├── Entity Linking: Match question entities to KG nodes
+  └── BFS Retrieval: Constrained traversal from anchor entities
 
-## 2. Getting Started
+Stage 2: Knowledge Embedding (Knowledge Adapter)
+  ├── Text Encoding: Frozen BERT encoder for triple text
+  ├── Structural Encoding: H+R-T positional MLP
+  ├── Fusion: Concatenate text + structural embeddings
+  └── Projection: 2-layer MLP to LLM embedding space
 
-This section guides you through setting up and running GraphPromptor.
-
-### Cloning the Repository
-
-Clone the GraphPromptor repository from GitHub:
-
-```bash
-git clone https://github.com/AetherForge/GraphPromptor.git
-cd GraphPromptor
+Stage 3: Knowledge Prompts Mixed Reasoning
+  ├── Soft Prompts: Knowledge embeddings via inputs_embeds
+  ├── Hard Prompts: Text instructions for LLM
+  └── Generation: Frozen LLaMA-3-8B-Instruct produces answer
 ```
 
-### Installing Dependencies
+### Component Specifications
 
-Install the required Python packages using pip:
+| Component | Implementation | Trainable |
+|-----------|---------------|-----------|
+| Text Encoder | BERT-base-uncased (768-dim) | No (frozen) |
+| Structural Encoder | H+R-T MLP (64-dim) | Yes |
+| Knowledge Encoder | 2-layer Transformer | Yes |
+| Projector | 2-layer MLP (832 → 4096) | Yes |
+| Hop Predictor | BERT + Linear (4 classes) | Separate training |
+| LLM | LLaMA-3-8B-Instruct (4096-dim) | No (frozen) |
 
-```bash
-pip install -r requirements.txt
+### Data Flow Diagram
+
+```
+User Question
+      │
+      ▼
+┌──────────────────┐
+│  Hop Predictor   │  ← BERT classifier predicts 1-4 hops
+└──────────────────┘
+      │
+      ▼
+┌──────────────────┐
+│  BFS Retrieval   │  ← Constrained graph traversal
+└──────────────────┘
+      │
+      ▼
+┌──────────────────────────────────────┐
+│  Knowledge Adapter                   │
+│  ┌────────────────┐                  │
+│  │ BERT (frozen)  │ → text_emb [768] │
+│  └────────────────┘                  │
+│  ┌────────────────┐                  │
+│  │ H+R-T Encoding │ → struct_emb [64]│
+│  └────────────────┘                  │
+│  ┌────────────────┐                  │
+│  │ Concatenate    │ → fused [832]    │
+│  └────────────────┘                  │
+│  ┌────────────────┐                  │
+│  │ KnowledgeEnc   │ → encoded [832]  │
+│  └────────────────┘                  │
+│  ┌────────────────┐                  │
+│  │ Projector MLP  │ → prompts [4096] │
+│  └────────────────┘                  │
+└──────────────────────────────────────┘
+      │
+      ▼
+┌──────────────────────────────────────┐
+│  LLaMA-3-8B-Instruct (frozen)        │
+│  inputs_embeds = soft + hard prompts │
+└──────────────────────────────────────┘
+      │
+      ▼
+   Answer
 ```
 
-### Setting Environment Variables
+## 3. Module Details
 
-Some components, particularly the Reasoning Module, may require API keys or other configuration via environment variables.
+### 3.1 Retrieval Module
 
-- **Required Variables:** (List specific required variables here, e.g., `GEMINI_API_KEY`)
-- **How to Set:** You can set these variables in your shell or use a `.env` file and a library like `python-dotenv`.
+**Location**: `lightprof/retrieval.py`
 
-## 3. Architecture
+The Retrieval Module extracts relevant reasoning paths from the Knowledge Graph.
 
-```mermaid
-flowchart TD
-    A[User Question] --> B[Retrieval Module]
-    B --> C["Reasoning Graph (subgraph)"]
-    C --> D[Knowledge Adapter]
-    D --> E[Soft Prompt Embeddings]
-    E --> F[Hard Prompt Template]
-    F --> G[LLM Inference]
-    G --> H[Answer]
-```
-
-- **Retrieval Module**: Predicts the number of hops needed for reasoning and extracts a focused reasoning graph.
-- **Knowledge Adapter**: Converts the reasoning subgraph into compact, fused embeddings that match the LLM input space.
-- **Reasoning Module**: Combines hard prompts and soft prompts to guide the frozen LLM to infer the final answer.
-
-```mermaid
-flowchart TD
-    A[User Question] --> B[Retrieval Module]
-    B --> C["Reasoning Graph (subgraph)"]
-    C --> D[Knowledge Adapter]
-    D --> E[Soft Prompt Embeddings]
-    E --> F[Hard Prompt Template]
-    F --> G[LLM Inference]
-    G --> H[Answer]
-```
-
-*Diagram illustrating the interaction flow between modules and the KG backend.*
-
-## 3. Design Details
-
-| Component | Inputs | Outputs | Description |
-|:---|:---|:---|:---|
-| RetrievalModule | question (str) | List of paths [(h,r,t)…] | Hop prediction + constrained BFS sampling |
-| KnowledgeAdapter | List of paths | Tensor [N×E] | Fusion of structure and text embeddings |
-| ReasoningModule | question, soft prompts | answer (str) | Inference through hard + soft prompting |
-
-**Training Strategy:**
-
-- Only the Knowledge Adapter and Projector layers are trainable.
-- Loss: Cross-entropy next-token prediction based on correct answers.
-- Soft Prompt: Compact representation injected into LLM input embeddings.
-
-## 4. Detailed Workflow
-
-### 4.1 KG Loading
-
-- Triples are loaded into a NetworkX DiGraph with (head, relation, tail) format.
-- Edge attributes store relation types.
-
-### 4.2 Retrieval Stage
-
-- Fine-tuned hop predictor (based on a BERT encoder) infers expected hop count.
-- Named entity recognition or simple matching identifies anchor entities.
-- Constrained BFS up to hop depth is performed.
-- Top-K reasoning paths are ranked based on semantic relevance.
-
-### 4.3 Knowledge Adapter Stage
-
-- Each triple is tokenized and embedded via a frozen BERT encoder.
-- Structural information (triple pattern) is encoded through a small MLP.
-- Structural and textual embeddings are fused and projected into the LLM's token space.
-
-### 4.4 Reasoning Stage
-
-- Hard prompts define the context/instructions.
-- Soft prompts (knowledge embeddings) are inserted between system/user messages.
-- LLM inference generates the answer in a fully frozen manner.
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant R as RetrievalModule
-    participant A as KnowledgeAdapter
-    participant M as ReasoningModule
-    U->>R: retrieve(question)
-    R-->>U: reasoning_paths
-    U->>A: encode(reasoning_paths)
-    A-->>U: soft_prompt_embeddings
-    U->>M: generate_answer(question, soft_prompt_embeddings)
-    M-->>U: answer
-```
-
-## 6. Usage Example
-
-This section provides a basic example. For a more detailed and interactive demonstration, please refer to the `notebooks/demo.ipynb` file.
+**Process**:
+1. **Hop Prediction**: BERT-based classifier predicts reasoning depth (1-4 hops)
+2. **Entity Linking**: Match question entities to KG nodes using fuzzy matching
+3. **BFS Traversal**: Breadth-first search up to predicted hop count
+4. **Path Sampling**: Select top-k paths based on relevance
 
 ```python
-from lightprof.utils import load_kg_from_triples, get_gemini_tokenizer
 from lightprof.retrieval import RetrievalModule
-from lightprof.adapter import KnowledgeAdapter
-from lightprof.reasoning import ReasoningModule
+from lightprof.data import FreebaseKG
 
-# 1. Load Knowledge Graph
-kg = load_kg_from_triples('data/freebase_triples.tsv')
+kg = FreebaseKG("data/freebase_triples.tsv")
+retrieval = RetrievalModule(kg, config.retrieval)
 
-# 2. Initialize Modules
-tokenizer = get_gemini_tokenizer()
-hop_predictor = ...  # Your trained hop predictor
-retriever = RetrievalModule(kg, hop_predictor, tokenizer)
-adapter = KnowledgeAdapter('bert-base-uncased', struct_emb_dim=128, llm_embed_dim=512)
-reasoner = ReasoningModule('gemini-2.5-flash-preview-04-17', tokenizer, hard_template="Answer the question: {question}\nGraph info: <soft_prompt>\nAnswer:")
-
-# 3. Run Inference
-question = "Which drugs did Lindsay Lohan abuse?"
-paths = retriever.retrieve(question)
-soft = adapter(paths)
-answer = reasoner.answer(question, soft)
-print(answer)
+question = "Where was Barack Obama born?"
+paths = retrieval.retrieve(question, anchor_entities=["Barack_Obama"])
+# Returns: [[("Barack_Obama", "place_of_birth", "Honolulu")]]
 ```
 
-## 6. Folder Structure
+### 3.2 Knowledge Adapter
+
+**Location**: `lightprof/adapter.py`
+
+The Knowledge Adapter converts reasoning paths into soft prompt embeddings.
+
+**Architecture**:
+- **BERT Encoder** (frozen): Encodes triple text → 768-dim
+- **Structural Embedding**: H+R-T positional encoding → 64-dim
+- **Concatenation**: Fuses text and structure → 832-dim
+- **Knowledge Encoder**: 2-layer Transformer → 832-dim
+- **Projector**: 2-layer MLP → 4096-dim (LLaMA embedding space)
+
+```python
+from lightprof.adapter import KnowledgeAdapter
+
+adapter = KnowledgeAdapter(config.model, config.adapter)
+soft_prompts = adapter(paths)  # [num_paths, 4096]
+```
+
+**H+R-T Encoding** (Paper Equation 4):
+```
+E_structural = MLP(E_head + E_relation - E_tail)
+```
+
+### 3.3 Reasoning Module
+
+**Location**: `lightprof/reasoning.py`
+
+The Reasoning Module generates answers using LLaMA-3-8B-Instruct with soft prompt injection.
+
+**Soft Prompt Injection**:
+```python
+# Combine soft prompts with hard prompt embeddings
+combined_embeds = torch.cat([soft_prompts, text_embeds], dim=1)
+
+# Generate using inputs_embeds (not input_ids)
+outputs = model.generate(
+    inputs_embeds=combined_embeds,
+    attention_mask=attention_mask,
+    max_new_tokens=64,
+)
+```
+
+**Hard Prompt Template**:
+```
+Based on the knowledge graphs, answer the following question.
+Question: {question}
+Answer:
+```
+
+### 3.4 Hop Predictor
+
+**Location**: `lightprof/models/hop_predictor.py`
+
+BERT-based classifier for predicting reasoning hop count.
+
+**Architecture**:
+- BERT encoder (frozen or fine-tuned)
+- Linear classifier: 768 → 4 (1-4 hops)
+- CrossEntropyLoss with 1-indexed labels
+
+```python
+from lightprof.models import HopPredictor
+
+predictor = HopPredictor(config.model)
+hop_count = predictor.predict("Where was Obama born?")  # Returns 1-4
+```
+
+## 4. Configuration
+
+### TOML Configuration
+
+```toml
+[model]
+llm_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+llm_embedding_dim = 4096
+bert_model_name = "bert-base-uncased"
+bert_embedding_dim = 768
+freeze_llm = true
+freeze_bert = true
+
+[adapter]
+structural_mlp_hidden_dim = 64
+knowledge_encoder_layers = 2
+knowledge_encoder_heads = 8
+projector_hidden_dim = 2048
+dropout = 0.1
+
+[retrieval]
+max_hops = 4
+top_k_relations = 10
+max_paths_per_question = 20
+use_hop_predictor = true
+
+[training]
+batch_size = 4
+learning_rate = 0.002
+num_epochs = 1
+warmup_ratio = 0.1
+weight_decay = 0.01
+```
+
+### Loading Configuration
+
+```python
+from lightprof.config import LightPROFConfig
+
+# Default configuration (paper-aligned)
+config = LightPROFConfig()
+
+# Load from TOML file
+config = LightPROFConfig.from_toml("configs/webqsp.toml")
+```
+
+## 5. Data Formats
+
+### Knowledge Graph (TSV)
+
+```
+head<TAB>relation<TAB>tail
+Barack_Obama	place_of_birth	Honolulu
+Honolulu	located_in	Hawaii
+Hawaii	country	United_States
+```
+
+### QA Dataset (JSONL)
+
+**WebQSP Format**:
+```json
+{
+  "question": "Where was Barack Obama born?",
+  "answer": ["Honolulu"],
+  "entities": ["Barack_Obama"],
+  "hops": 1
+}
+```
+
+**CWQ Format**:
+```json
+{
+  "question": "What is the capital of the country where Obama was born?",
+  "answer": ["Washington, D.C."],
+  "entities": ["Barack_Obama"],
+  "hops": 3
+}
+```
+
+## 6. Training
+
+### Training the Knowledge Adapter
+
+```python
+from lightprof.train import Trainer
+from lightprof.data import WebQSPDataset, FreebaseKG
+
+# Load data
+kg = FreebaseKG("data/freebase.tsv")
+train_data = WebQSPDataset("data/webqsp_train.jsonl", kg)
+
+# Initialize trainer
+trainer = Trainer(config, kg)
+
+# Train (only adapter is updated, LLM frozen)
+trainer.train(train_data, num_epochs=1)
+
+# Save checkpoint
+trainer.save_checkpoint("checkpoints/adapter.pt")
+```
+
+### Training the Hop Predictor
 
 ```bash
-GraphPromptor/
-├── README.md            # Project overview
-├── requirements.txt     # Python dependencies
-├── data/                # Knowledge Graph triples
-│   ├── freebase_triples.tsv
-│   └── webqsp.jsonl
-├── lightprof/
-│   ├── __init__.py
-│   ├── utils.py         # Loaders, tokenizers
-│   ├── retrieval.py     # Retrieval logic
-│   ├── adapter.py       # Knowledge Adapter module
-│   ├── reasoning.py     # Reasoning through LLM
-│   └── train.py         # Training loop for Adapter
-├── scripts/             # KG conversion utilities
-└── notebooks/           # Example workflows
-    └── demo.ipynb
+uv run python scripts/train_hop_predictor.py \
+    --train_data data/webqsp_train.jsonl \
+    --val_data data/webqsp_val.jsonl \
+    --output_dir checkpoints/hop_predictor
 ```
 
-## 8. Critical Considerations
+### Training Configuration (Per Paper)
 
-### 7.1 LLM Selection
+| Parameter | Value |
+|-----------|-------|
+| Batch Size | 4 |
+| Learning Rate | 2e-3 |
+| Optimizer | AdamW |
+| Scheduler | Cosine annealing |
+| Warmup Ratio | 0.1 |
+| Weight Decay | 0.01 |
+| Epochs | 1 |
 
-| Model | Context Window | Pros | Cons |
-|:---|:---|:---|:---|
-| Gemini 2.5-Flash | 1M tokens | Fast, low cost, long input | Limited fine-grain control |
-| GPT-4.1 | 32K tokens | Strong reasoning | High cost |
-| O4-mini | 128K tokens | Low cost, decent performance | More hallucination risk |
+## 7. Evaluation
 
-**Recommendation:** Start with Gemini 2.5-Flash for efficient large context multi-hop QA.
+### Hits@1 Metric
 
-### 7.2 KG Backend Selection
+The primary evaluation metric is Hits@1 (exact match accuracy after normalization).
 
-| Backend | Scale | Pros | Cons |
-|:---|:---|:---|:---|
-| NetworkX | Small/medium (up to 1M triples) | Fast prototyping, easy BFS | Memory-bound |
-| DGL-KE | Large (10M+ triples) | GPU-accelerated embeddings | Higher complexity |
-| Neo4j | Enterprise-scale | Indexing, clustering | Requires server infra |
+```bash
+uv run python scripts/evaluate.py \
+    --config configs/webqsp.toml \
+    --checkpoint checkpoints/adapter.pt \
+    --dataset webqsp \
+    --split test
+```
 
-**Recommendation:** Start with NetworkX, migrate to DGL-KE when scaling.
+### Paper Results
 
-### 7.3 Training Loop
+| Dataset | Hits@1 |
+|---------|--------|
+| WebQSP  | 83.8%  |
+| CWQ     | 59.3%  |
 
-- **Soft-prompt only:** Lightweight, easy to tune.
-- **LoRA augmentation (optional):** Boosts reasoning depth if necessary.
-- **Optimizer:** AdamW with a cosine scheduler.
-- **Learning Rate:** ~2e-3 (for soft prompt adapters).
+## 8. Project Structure
 
-## 9. Contribution Guidelines
+```
+LightPROF/
+├── lightprof/
+│   ├── __init__.py           # Package exports
+│   ├── config.py             # Configuration dataclasses
+│   ├── adapter.py            # Knowledge Adapter module
+│   ├── retrieval.py          # Retrieval with hop prediction
+│   ├── reasoning.py          # LLM reasoning with soft prompts
+│   ├── train.py              # Training pipeline
+│   ├── utils.py              # Utilities
+│   ├── models/
+│   │   ├── hop_predictor.py  # BERT hop classifier
+│   │   ├── knowledge_encoder.py  # Transformer encoder
+│   │   └── projector.py      # MLP projector
+│   └── data/
+│       ├── freebase.py       # FreebaseKG loader
+│       ├── webqsp.py         # WebQSP dataset
+│       └── cwq.py            # CWQ dataset
+├── scripts/
+│   ├── evaluate.py           # Hits@1 evaluation
+│   └── train_hop_predictor.py
+├── tests/                    # Test suite (113 tests)
+├── data/                     # Sample data files
+└── docs/                     # Documentation
+```
 
-We welcome contributions to GraphPromptor! Please follow these guidelines:
+## 9. Testing
 
-- **Reporting Bugs:** If you find a bug, please open an issue on GitHub with a clear description and steps to reproduce.
-- **Suggesting Features:** For new features or improvements, open an issue to discuss your ideas before submitting a pull request.
-- **Submitting Pull Requests:**
-  - Fork the repository and create a new branch for your changes.
-  - Ensure your code adheres to any existing code style guidelines.
-  - Write clear and concise commit messages.
-  - Submit a pull request to the `main` branch.
-- **Code Style:** (Mention or link to code style guidelines if they exist)
+### Running Tests
 
-## 10. Troubleshooting / FAQ
+```bash
+# Run all tests
+uv run pytest tests/ -v
 
-This section will be populated over time with common issues, errors, and their solutions based on user feedback.
+# Run with coverage
+uv run pytest tests/ --cov=lightprof
 
-## 11. Future Enhancements
+# Skip LLM integration tests
+SKIP_LLM_TESTS=1 uv run pytest tests/ -v
+```
 
-- Plug-and-play for multiple LLM backends (OpenAI, Anthropic, Cohere)
-- KG streaming retrieval for extremely large graphs
-- Cross-modal Knowledge Adapter (images, tables)
-- Multi-agent Reasoning Chains over Knowledge Graphs
+### Test Results
 
-## 12. Conclusion
+- **113 passed**: All unit and integration tests
+- **5 skipped**: LLM integration tests (require `HF_TOKEN` for Llama access)
 
-GraphPromptor provides a powerful starting point for extending LLMs with up-to-date, structured knowledge reasoning—efficiently, modularly, and scalably.
+### Environment Variables
+
+| Variable | Purpose | Required |
+|----------|---------|----------|
+| `HF_TOKEN` | HuggingFace API token for Llama | For LLM tests |
+| `SKIP_LLM_TESTS` | Set to "1" to skip LLM tests | Optional |
+
+## 10. Key Implementation Details
+
+### TransformerEncoder Configuration
+
+The Knowledge Encoder uses pre-norm architecture with nested tensors disabled:
+
+```python
+encoder_layer = nn.TransformerEncoderLayer(
+    d_model=input_dim,
+    nhead=num_heads,
+    dim_feedforward=dim_feedforward,
+    dropout=dropout,
+    activation="gelu",
+    batch_first=True,
+    norm_first=True,  # Pre-norm architecture
+)
+
+self.encoder = nn.TransformerEncoder(
+    encoder_layer,
+    num_layers=num_layers,
+    enable_nested_tensor=False,  # Required with norm_first=True
+)
+```
+
+### Soft Prompt Injection
+
+Embeddings are injected via `inputs_embeds` parameter:
+
+```python
+# Get LLM embedding layer
+embed_layer = model.get_input_embeddings()
+
+# Convert hard prompt to embeddings
+text_embeds = embed_layer(input_ids)
+
+# Concatenate soft prompts with hard prompt embeddings
+combined = torch.cat([soft_prompts.unsqueeze(0), text_embeds], dim=1)
+
+# Generate with combined embeddings
+outputs = model.generate(inputs_embeds=combined, ...)
+```
+
+### Hop Predictor Labels
+
+Labels are 1-indexed (1-4 for hop counts):
+
+```python
+# In training
+loss = F.cross_entropy(logits, labels - 1)  # Convert to 0-indexed
+
+# In prediction
+predicted_hops = logits.argmax(dim=-1) + 1  # Convert back to 1-indexed
+```
+
+## 11. Future Work
+
+1. **Full Training Run**: Train on complete WebQSP and CWQ datasets
+2. **Evaluation Pipeline**: Benchmark against paper results
+3. **Model Optimization**: Add quantization support for lower memory
+4. **Inference Optimization**: Batch processing and caching
+5. **Additional Datasets**: Support for MetaQA and other KGQA benchmarks
+
+## 12. Citation
+
+If you use this implementation, please cite both the original paper and this repository:
+
+**Original Paper:**
+```bibtex
+@misc{ao2025lightproflightweightreasoningframework,
+      title={LightPROF: A Lightweight Reasoning Framework for Large Language Model on Knowledge Graph},
+      author={Tu Ao and Yanhua Yu and Yuling Wang and Yang Deng and Zirui Guo and Liang Pang and Pinghui Wang and Tat-Seng Chua and Xiao Zhang and Zhen Cai},
+      year={2025},
+      eprint={2504.03137},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2504.03137},
+}
+```
+
+**This Implementation:**
+```bibtex
+@software{mathews2025lightprof,
+      title={LightPROF: PyTorch Implementation of Lightweight Reasoning Framework for LLMs on Knowledge Graphs},
+      author={Tom Mathews},
+      year={2025},
+      url={https://github.com/Mathews-Tom/LightPROF},
+      note={Open-source implementation with LLaMA-3-8B-Instruct and BERT-based Knowledge Adapter}
+}
+```
+
+## 13. References
+
+- Paper: [arXiv:2504.03137](https://arxiv.org/abs/2504.03137)
+- LLaMA-3: [meta-llama/Meta-Llama-3-8B-Instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct)
+- BERT: [bert-base-uncased](https://huggingface.co/bert-base-uncased)
