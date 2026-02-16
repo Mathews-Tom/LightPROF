@@ -25,17 +25,19 @@ from pathlib import Path
 # Data directory structure
 DATA_DIR = Path("data")
 
-# Dataset URLs and checksums
+# Dataset URLs
+# Previous URLs from salesforce/rng-kbqa and TimDettmers/ConvE are dead (404).
+# Updated to alternative mirrors verified as of 2026-02.
 DATASETS = {
     "webqsp": {
         "description": "WebQuestions Semantic Parses (WebQSP)",
         "files": {
             "train": {
-                "url": "https://raw.githubusercontent.com/salesforce/rng-kbqa/main/data/WebQSP/WebQSP.train.json",
+                "url": "https://raw.githubusercontent.com/AskNowQA/SQG/master/data/WebQuestionsSP/WebQSP.train.json",
                 "filename": "webqsp/train.json",
             },
             "test": {
-                "url": "https://raw.githubusercontent.com/salesforce/rng-kbqa/main/data/WebQSP/WebQSP.test.json",
+                "url": "https://raw.githubusercontent.com/AskNowQA/SQG/master/data/WebQuestionsSP/WebQSP.test.json",
                 "filename": "webqsp/test.json",
             },
         },
@@ -44,15 +46,15 @@ DATASETS = {
         "description": "ComplexWebQuestions (CWQ)",
         "files": {
             "train": {
-                "url": "https://raw.githubusercontent.com/salesforce/rng-kbqa/main/data/CWQ/ComplexWebQuestions_train.json",
+                "url": "https://www.dropbox.com/sh/7pkwkrfnwqhsnpo/AAAIHeWX0cPpbpwK6w06BCxva/ComplexWebQuestions_train.json?dl=1",
                 "filename": "cwq/train.json",
             },
             "dev": {
-                "url": "https://raw.githubusercontent.com/salesforce/rng-kbqa/main/data/CWQ/ComplexWebQuestions_dev.json",
+                "url": "https://www.dropbox.com/sh/7pkwkrfnwqhsnpo/AADH8beLbOUWxwvY_K38E3ADa/ComplexWebQuestions_dev.json?dl=1",
                 "filename": "cwq/dev.json",
             },
             "test": {
-                "url": "https://raw.githubusercontent.com/salesforce/rng-kbqa/main/data/CWQ/ComplexWebQuestions_test.json",
+                "url": "https://www.dropbox.com/sh/7pkwkrfnwqhsnpo/AABr4ysSy_Tg8Wfxww4i_UWda/ComplexWebQuestions_test.json?dl=1",
                 "filename": "cwq/test.json",
             },
         },
@@ -61,7 +63,7 @@ DATASETS = {
         "description": "Freebase subset (FB15k-237 or custom)",
         "files": {
             "triples": {
-                "url": "https://raw.githubusercontent.com/TimDettmers/ConvE/master/data/FB15k-237/train.txt",
+                "url": "https://raw.githubusercontent.com/villmow/datasets_knowledge_embedding/master/FB15k-237/train.txt",
                 "filename": "freebase_triples.tsv",
             },
         },
